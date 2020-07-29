@@ -108,6 +108,11 @@ func Become(ctx context.Context, lockName string) error {
 			log.Info("Became the leader.")
 			return nil
 		case apierrors.IsAlreadyExists(err):
+			if err := client.Get(ctx, crclient.ObjectKey{Namespace: ns, Name: lockName}, existing); err != nil {
+				log.Info("Leader lock configmap has been deleted while executing this code.")
+				continue
+			}
+
 			// refresh the lock so we use current leader
 			key := crclient.ObjectKey{Namespace: ns, Name: lockName}
 			if err := client.Get(ctx, key, existing); err != nil {
@@ -123,6 +128,8 @@ func Become(ctx context.Context, lockName string) error {
 				log.Info("Leader lock configmap owner reference must be a pod.", "OwnerReference", existingOwners[0])
 			default:
 				leaderPod := &corev1.Pod{}
+				leaderNode := &corev1.Node{}
+
 				key = crclient.ObjectKey{Namespace: ns, Name: existingOwners[0].Name}
 				err = client.Get(ctx, key, leaderPod)
 				switch {
@@ -137,6 +144,24 @@ func Become(ctx context.Context, lockName string) error {
 					err := client.Delete(ctx, leaderPod)
 					if err != nil {
 						log.Error(err, "Leader pod could not be deleted.")
+					}
+
+				case getNode(ctx, client, leaderPod.Spec.NodeName, leaderNode) == nil && isNotReadyNode(*leaderNode):
+					log.Info("The status of the node where operator pod with leader lock was running has been 'notReady'")
+					log.Info("Deleting the leader.")
+
+					err := client.Delete(ctx, leaderPod)
+					if err != nil {
+						log.Error(err, "Leader pod could not be deleted.")
+					} else {
+						err := client.Delete(ctx, existing)
+						switch {
+						case err == nil:
+						case apierrors.IsNotFound(err):
+							log.Info("Leader lock configmap has been removed by other operator.")
+						case err != nil:
+							return err
+						}
 					}
 
 				default:
@@ -182,4 +207,19 @@ func isPodEvicted(pod corev1.Pod) bool {
 	podFailed := pod.Status.Phase == corev1.PodFailed
 	podEvicted := pod.Status.Reason == "Evicted"
 	return podFailed && podEvicted
+}
+
+func getNode(ctx context.Context, client crclient.Client, nodeName string, node *corev1.Node) error {
+	key := crclient.ObjectKey{Namespace: "", Name: nodeName}
+	err := client.Get(ctx, key, node)
+	return err
+}
+
+func isNotReadyNode(node corev1.Node) bool {
+	for _, condition := range node.Status.Conditions {
+		if condition.Type == corev1.NodeReady && condition.Status != corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
 }
